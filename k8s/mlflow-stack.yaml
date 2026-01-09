@@ -1,0 +1,288 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: mlflow
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: mlflow-secrets
+  namespace: mlflow
+type: Opaque
+stringData:
+  AWS_ACCESS_KEY_ID: "test"
+  AWS_SECRET_ACCESS_KEY: "test"
+  POSTGRES_PASSWORD: "mlflow123"
+  POSTGRES_USER: "mlflow"
+  POSTGRES_DB: "mlflow_db"
+---
+# S3 Initialization Script
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: s3-init-script
+  namespace: mlflow
+data:
+  init_s3.py: |
+    import boto3
+    import os
+    import time
+
+    endpoint = os.environ.get("S3_ENDPOINT_URL")
+    key = os.environ.get("AWS_ACCESS_KEY_ID")
+    secret = os.environ.get("AWS_SECRET_ACCESS_KEY")
+    bucket_name = os.environ.get("BUCKET_NAME")
+
+    print(f"Attempting to connect to {endpoint}...")
+    s3 = boto3.client(
+        "s3",
+        endpoint_url=endpoint,
+        aws_access_key_id=key,
+        aws_secret_access_key=secret,
+        region_name="us-east-1"
+    )
+
+    for i in range(10):
+        try:
+            s3.create_bucket(Bucket=bucket_name)
+            print(f"Bucket '{bucket_name}' created successfully.")
+            break
+        except Exception as e:
+            print(f"Waiting for S3... ({e})")
+            time.sleep(5)
+---
+# --- SeaweedFS (S3 Gateway) ---
+apiVersion: v1
+kind: Service
+metadata:
+  name: seaweedfs
+  namespace: mlflow
+spec:
+  ports:
+  - port: 8333
+    targetPort: 8333
+    name: s3
+  - port: 9333
+    targetPort: 9333
+    name: master
+  selector:
+    app: seaweedfs
+  clusterIP: None
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: seaweedfs
+  namespace: mlflow
+spec:
+  serviceName: "seaweedfs"
+  replicas: 1
+  selector:
+    matchLabels:
+      app: seaweedfs
+  template:
+    metadata:
+      labels:
+        app: seaweedfs
+    spec:
+      containers:
+      - name: seaweedfs
+        image: chrislusf/seaweedfs:latest
+        command: ["/usr/bin/weed", "server", "-s3", "-s3.port=8333", "-dir=/data", "-ip=0.0.0.0"]
+        ports:
+        - containerPort: 8333
+        - containerPort: 9333
+        volumeMounts:
+        - name: seaweed-data
+          mountPath: /data
+  volumeClaimTemplates:
+  - metadata:
+      name: seaweed-data
+    spec:
+      accessModes: [ "ReadWriteOnce" ]
+      resources:
+        requests:
+          storage: 10Gi
+---
+# --- PostgreSQL (Database) ---
+# CRITICAL: This was missing in your snippet!
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  namespace: mlflow
+spec:
+  ports:
+  - port: 5432
+  selector:
+    app: postgres
+  clusterIP: None
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+  namespace: mlflow
+spec:
+  serviceName: "postgres"
+  replicas: 1
+  selector:
+    matchLabels:
+      app: postgres
+  template:
+    metadata:
+      labels:
+        app: postgres
+    spec:
+      containers:
+      - name: postgres
+        image: postgres:13
+        ports:
+        - containerPort: 5432
+        env:
+        - name: POSTGRES_USER
+          valueFrom:
+            secretKeyRef:
+              name: mlflow-secrets
+              key: POSTGRES_USER
+        - name: POSTGRES_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: mlflow-secrets
+              key: POSTGRES_PASSWORD
+        - name: POSTGRES_DB
+          valueFrom:
+            secretKeyRef:
+              name: mlflow-secrets
+              key: POSTGRES_DB
+        volumeMounts:
+        - name: pg-data
+          mountPath: /var/lib/postgresql/data
+  volumeClaimTemplates:
+  - metadata:
+      name: pg-data
+    spec:
+      accessModes: [ "ReadWriteOnce" ]
+      resources:
+        requests:
+          storage: 5Gi
+---
+# --- Init Job (Create Bucket) ---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: aws-init-job
+  namespace: mlflow
+spec:
+  template:
+    spec:
+      containers:
+      - name: aws-init
+        image: python:3.11-slim
+        command: ["/bin/sh", "-c"]
+        args:
+          - pip install boto3 && python /app/init_s3.py
+        env:
+        - name: S3_ENDPOINT_URL
+          value: "http://seaweedfs.mlflow.svc.cluster.local:8333"
+        - name: BUCKET_NAME
+          value: "mlops-bucket"
+        - name: AWS_ACCESS_KEY_ID
+          valueFrom:
+            secretKeyRef:
+              name: mlflow-secrets
+              key: AWS_ACCESS_KEY_ID
+        - name: AWS_SECRET_ACCESS_KEY
+          valueFrom:
+            secretKeyRef:
+              name: mlflow-secrets
+              key: AWS_SECRET_ACCESS_KEY
+        volumeMounts:
+        - name: script-vol
+          mountPath: /app
+      restartPolicy: OnFailure
+      volumes:
+      - name: script-vol
+        configMap:
+          name: s3-init-script
+---
+# --- MLflow Server ---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mlflow
+  namespace: mlflow
+spec:
+  type: ClusterIP
+  ports:
+  - port: 5000
+    targetPort: 5000
+  selector:
+    app: mlflow
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mlflow
+  namespace: mlflow
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mlflow
+  template:
+    metadata:
+      labels:
+        app: mlflow
+    spec:
+      # Run as root to allow pip install
+      securityContext:
+        runAsUser: 0
+      initContainers:
+      - name: wait-for-db
+        image: busybox
+        command: ['sh', '-c', 'until nc -z postgres 5432; do echo waiting for postgres; sleep 2; done;']
+      containers:
+      - name: mlflow
+        # ✅ UPDATED IMAGE
+        image: ghcr.io/mlflow/mlflow:v3.7.0
+        imagePullPolicy: IfNotPresent
+        command: ["/bin/sh", "-c"]
+        args:
+          - |
+            # ✅ ADDED boto3 (Required for S3 support)
+            pip install psycopg2-binary gunicorn boto3 && \
+            mlflow server \
+            --host 0.0.0.0 \
+            --port 5000 \
+            --backend-store-uri postgresql://$(POSTGRES_USER):$(POSTGRES_PASSWORD)@postgres.mlflow.svc.cluster.local:5432/mlflow_db \
+            --default-artifact-root s3://mlops-bucket
+        ports:
+        - containerPort: 5000
+        env:
+        - name: MLFLOW_S3_ENDPOINT_URL
+          value: "http://seaweedfs.mlflow.svc.cluster.local:8333"
+        - name: MLFLOW_S3_IGNORE_TLS
+          value: "true"
+        - name: AWS_DEFAULT_REGION
+          value: "us-east-1"
+        - name: AWS_ACCESS_KEY_ID
+          valueFrom:
+            secretKeyRef:
+              name: mlflow-secrets
+              key: AWS_ACCESS_KEY_ID
+        - name: AWS_SECRET_ACCESS_KEY
+          valueFrom:
+            secretKeyRef:
+              name: mlflow-secrets
+              key: AWS_SECRET_ACCESS_KEY
+        - name: POSTGRES_USER
+          valueFrom:
+            secretKeyRef:
+              name: mlflow-secrets
+              key: POSTGRES_USER
+        - name: POSTGRES_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: mlflow-secrets
+              key: POSTGRES_PASSWORD
