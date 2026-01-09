@@ -58,8 +58,6 @@ kubectl apply -f k8s/split-learning.yaml
 Port Forward MLflow:
 ```bash
 kubectl port-forward svc/mlflow -n mlflow 5000:5000
-# Forward local port 8333 to the service 'seaweedfs' on port 8333
-kubectl port-forward svc/seaweedfs -n mlflow 8333:8333
 ```
 Access Dashboard: Open http://localhost:5000 in your browser.
 
