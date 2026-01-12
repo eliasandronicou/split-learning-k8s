@@ -37,6 +37,8 @@ spec:
           env:
             - name: MLFLOW_TRACKING_URI
               value: "http://mlflow.mlflow.svc.cluster.local:5000"
+            - name: LEARNING_MODE
+              value: "split"  # Options: "split" or "federated"
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -59,3 +61,6 @@ spec:
           imagePullPolicy: Never
           # Start the training loop
           command: ["python", "client_part.py"]
+          env:
+            - name: LEARNING_MODE
+              value: "split"  # Options: "split" or "federated"
