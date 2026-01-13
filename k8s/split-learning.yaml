@@ -28,7 +28,7 @@ spec:
     spec:
       containers:
         - name: server
-          image: split-sim:latest
+          image: split-learning:optimized
           imagePullPolicy: Never
           # Start the FastAPI server
           command: ["uvicorn", "server_part:app", "--host", "0.0.0.0", "--port", "8000"]
@@ -57,7 +57,7 @@ spec:
     spec:
       containers:
         - name: client
-          image: split-sim:latest
+          image: split-learning:optimized
           imagePullPolicy: Never
           # Start the training loop
           command: ["python", "client_part.py"]

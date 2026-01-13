@@ -1,0 +1,55 @@
+# Git files
+.git
+.gitignore
+.gitattributes
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Virtual environments
+venv/
+env/
+ENV/
+.venv
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+*.log
+
+# Documentation
+*.md
+!README.md
+
+# Kubernetes manifests (not needed in container)
+k8s/
+*.yaml
+*.yml
+
+# Model files (if large, should be mounted or downloaded)
+*.pth
+*.pt
+*.pkl
+*.h5
+
+# Data files
+data/
+datasets/
+*.csv
+*.json
+
+# Misc
+.DS_Store
+Thumbs.db

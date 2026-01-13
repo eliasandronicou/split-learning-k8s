@@ -245,7 +245,7 @@ spec:
       containers:
       - name: mlflow
         # ✅ UPDATED IMAGE
-        image: ghcr.io/mlflow/mlflow:v3.7.0
+        image: ghcr.io/mlflow/mlflow:v2.9.2
         imagePullPolicy: IfNotPresent
         command: ["/bin/sh", "-c"]
         args:
