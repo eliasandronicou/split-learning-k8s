@@ -25,6 +25,7 @@ RUN pip install --no-cache-dir \
     uvicorn[standard]==0.27.0 \
     requests==2.31.0 \
     mlflow==2.9.2 \
+    boto3==1.34.0 \
     numpy==1.26.3 \
     scikit-learn==1.4.0
 

@@ -64,10 +64,9 @@ spec:
           env:
             - name: LEARNING_MODE
               value: "split"  # Options: "split" or "federated"
-          volumeMounts:
-            - name: mnist-data
-              mountPath: /app/data
-      volumes:
-        - name: mnist-data
-          persistentVolumeClaim:
-            claimName: mnist-data-pvc
+            - name: S3_ENDPOINT_URL
+              value: "http://seaweedfs.mlflow.svc.cluster.local:8333"
+            - name: AWS_ACCESS_KEY_ID
+              value: "test"
+            - name: AWS_SECRET_ACCESS_KEY
+              value: "test"

@@ -6,6 +6,8 @@ from torchvision import datasets, transforms
 import pickle
 import requests
 import os
+import boto3
+from botocore.exceptions import ClientError
 from model_def import get_model
 
 # Setup
@@ -15,10 +17,85 @@ model = get_model(role="client").to(device)
 optimizer = optim.SGD(model.parameters(), lr=0.01)
 criterion = nn.CrossEntropyLoss()
 
-# Fake Data (MNIST)
-transform = transforms.Compose([transforms.ToTensor(), transforms.Normalize((0.1307,), (0.3081,))])
-dataset = datasets.MNIST('./data', train=True, download=True, transform=transform)
-train_loader = DataLoader(dataset, batch_size=64, shuffle=True)
+# SeaweedFS S3 configuration
+s3_endpoint = os.getenv("S3_ENDPOINT_URL", "http://seaweedfs.mlflow.svc.cluster.local:8333")
+s3_access_key = os.getenv("AWS_ACCESS_KEY_ID", "test")
+s3_secret_key = os.getenv("AWS_SECRET_ACCESS_KEY", "test")
+bucket_name = "mlops-bucket"
+s3_key = "datasets/mnist_dataset.pkl"
+
+# Initialize S3 client
+s3_client = boto3.client(
+    's3',
+    endpoint_url=s3_endpoint,
+    aws_access_key_id=s3_access_key,
+    aws_secret_access_key=s3_secret_key,
+    region_name='us-east-1'
+)
+
+# Load MNIST dataset from S3 or download
+try:
+    print(f"Checking if MNIST dataset exists in S3 bucket '{bucket_name}'...")
+    s3_client.head_object(Bucket=bucket_name, Key=s3_key)
+    
+    print("✓ MNIST dataset found in S3! Downloading from cache...")
+    
+    # Download from S3
+    local_s3_path = '/tmp/mnist_from_s3.pkl'
+    s3_client.download_file(bucket_name, s3_key, local_s3_path)
+    
+    # Load the cached dataset
+    with open(local_s3_path, 'rb') as f:
+        cached_data = pickle.load(f)
+    
+    train_dataset = cached_data['train']
+    test_dataset = cached_data['test']
+    
+    print(f"✓ Loaded from S3 cache - Train: {len(train_dataset)}, Test: {len(test_dataset)}")
+    
+except ClientError as e:
+    if e.response['Error']['Code'] == '404':
+        print("MNIST dataset not found in S3. Downloading from source...")
+        
+        # Download MNIST from source
+        transform = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize((0.1307,), (0.3081,))
+        ])
+        
+        train_dataset = datasets.MNIST(
+            './data', 
+            train=True, 
+            download=True, 
+            transform=transform
+        )
+        
+        test_dataset = datasets.MNIST(
+            './data', 
+            train=False, 
+            download=True, 
+            transform=transform
+        )
+        
+        print(f"✓ Downloaded - Train: {len(train_dataset)}, Test: {len(test_dataset)}")
+        
+        # Upload to S3 for future use
+        print(f"Uploading MNIST dataset to S3 bucket '{bucket_name}'...")
+        
+        local_upload_path = '/tmp/mnist_to_upload.pkl'
+        with open(local_upload_path, 'wb') as f:
+            pickle.dump({
+                'train': train_dataset,
+                'test': test_dataset
+            }, f)
+        
+        s3_client.upload_file(local_upload_path, bucket_name, s3_key)
+        print(f"✓ Uploaded to S3: s3://{bucket_name}/{s3_key}")
+    else:
+        raise
+
+# Create DataLoader
+train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True)
 
 SERVER_URL_SPLIT = "http://split-server.mlflow.svc.cluster.local:8000/forward_pass"
 SERVER_URL_FEDERATED = "http://split-server.mlflow.svc.cluster.local:8000/aggregate_weights"
