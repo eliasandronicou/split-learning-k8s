@@ -1,28 +1,62 @@
-import torch
-import torch.nn as nn
-import torch.optim as optim
-from torch.utils.data import DataLoader
-from torchvision import datasets, transforms
+import tensorflow as tf
+from tensorflow import keras
+from tensorflow.keras import layers
 import pickle
 import requests
 import os
 import boto3
 from botocore.exceptions import ClientError
-from model_def import get_model
+import numpy as np
 
 # Setup
-device = "cpu"
 learning_mode = os.getenv("LEARNING_MODE", "split").lower()
-model = get_model(role="client").to(device)
-optimizer = optim.SGD(model.parameters(), lr=0.01)
-criterion = nn.CrossEntropyLoss()
+
+# Create TensorFlow/Keras model for client (Part A)
+def create_client_model():
+    """Client-side model for split learning"""
+    model = keras.Sequential([
+        layers.Input(shape=(28, 28, 1)),
+        layers.Conv2D(32, 3, activation='relu'),
+    ], name='ClientModel')
+    
+    model.compile(
+        optimizer='adam',
+        loss='sparse_categorical_crossentropy',
+        metrics=['accuracy']
+    )
+    return model
+
+# Create full model for federated learning
+def create_full_model():
+    """Full model for federated learning"""
+    model = keras.Sequential([
+        layers.Input(shape=(28, 28, 1)),
+        layers.Conv2D(32, 3, activation='relu'),
+        layers.Conv2D(64, 3, activation='relu'),
+        layers.MaxPooling2D(2),
+        layers.Flatten(),
+        layers.Dense(10, activation='softmax')
+    ], name='FullModel')
+    
+    model.compile(
+        optimizer='adam',
+        loss='sparse_categorical_crossentropy',
+        metrics=['accuracy']
+    )
+    return model
+
+# Get appropriate model based on learning mode
+if learning_mode == "split":
+    model = create_client_model()
+else:  # federated
+    model = create_full_model()
 
 # SeaweedFS S3 configuration
 s3_endpoint = os.getenv("S3_ENDPOINT_URL", "http://seaweedfs.mlflow.svc.cluster.local:8333")
 s3_access_key = os.getenv("AWS_ACCESS_KEY_ID", "test")
 s3_secret_key = os.getenv("AWS_SECRET_ACCESS_KEY", "test")
 bucket_name = "mlops-bucket"
-s3_key = "datasets/mnist_dataset.pkl"
+s3_key = "datasets/mnist_dataset_tf.pkl"
 
 # Initialize S3 client
 s3_client = boto3.client(
@@ -48,36 +82,35 @@ try:
     with open(local_s3_path, 'rb') as f:
         cached_data = pickle.load(f)
     
-    train_dataset = cached_data['train']
-    test_dataset = cached_data['test']
+    train_images = cached_data['train_images']
+    train_labels = cached_data['train_labels']
+    test_images = cached_data['test_images']
+    test_labels = cached_data['test_labels']
     
-    print(f"✓ Loaded from S3 cache - Train: {len(train_dataset)}, Test: {len(test_dataset)}")
+    print(f"✓ Loaded from S3 cache - Train: {len(train_images)}, Test: {len(test_images)}")
     
 except ClientError as e:
     if e.response['Error']['Code'] == '404':
         print("MNIST dataset not found in S3. Downloading from source...")
         
-        # Download MNIST from source
-        transform = transforms.Compose([
-            transforms.ToTensor(),
-            transforms.Normalize((0.1307,), (0.3081,))
-        ])
+        # Download MNIST using Keras
+        (train_images, train_labels), (test_images, test_labels) = keras.datasets.mnist.load_data()
         
-        train_dataset = datasets.MNIST(
-            './data', 
-            train=True, 
-            download=True, 
-            transform=transform
-        )
+        # Normalize and reshape for CNN input (28, 28, 1)
+        train_images = train_images.astype('float32') / 255.0
+        test_images = test_images.astype('float32') / 255.0
         
-        test_dataset = datasets.MNIST(
-            './data', 
-            train=False, 
-            download=True, 
-            transform=transform
-        )
+        # Add channel dimension
+        train_images = np.expand_dims(train_images, -1)
+        test_images = np.expand_dims(test_images, -1)
         
-        print(f"✓ Downloaded - Train: {len(train_dataset)}, Test: {len(test_dataset)}")
+        # Normalize using MNIST stats (for consistency)
+        mean = 0.1307
+        std = 0.3081
+        train_images = (train_images - mean) / std
+        test_images = (test_images - mean) / std
+        
+        print(f"✓ Downloaded - Train: {len(train_images)}, Test: {len(test_images)}")
         
         # Upload to S3 for future use
         print(f"Uploading MNIST dataset to S3 bucket '{bucket_name}'...")
@@ -85,8 +118,10 @@ except ClientError as e:
         local_upload_path = '/tmp/mnist_to_upload.pkl'
         with open(local_upload_path, 'wb') as f:
             pickle.dump({
-                'train': train_dataset,
-                'test': test_dataset
+                'train_images': train_images,
+                'train_labels': train_labels,
+                'test_images': test_images,
+                'test_labels': test_labels
             }, f)
         
         s3_client.upload_file(local_upload_path, bucket_name, s3_key)
@@ -94,119 +129,102 @@ except ClientError as e:
     else:
         raise
 
-# Create DataLoader
-train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True)
-
 SERVER_URL_SPLIT = "http://split-server.mlflow.svc.cluster.local:8000/forward_pass"
 SERVER_URL_FEDERATED = "http://split-server.mlflow.svc.cluster.local:8000/aggregate_weights"
 
-def train_split_learning():
-    """Training loop for Split Learning mode"""
-    model.train()
-    global_step = 0
-    for epoch in range(1, 4):  # Train for 3 epochs
-        print(f"--- [SPLIT LEARNING] Starting Epoch {epoch} ---")
+print(f"Starting training in {learning_mode.upper()} mode...")
+
+if learning_mode == "split":
+    # Split Learning Training Loop
+    batch_size = 64
+    num_batches = len(train_images) // batch_size
+    
+    for epoch in range(1, 4):  # 3 epochs
+        print(f"--- Epoch {epoch} ---")
         
-        for batch_idx, (data, target) in enumerate(train_loader):
-            data, target = data.to(device), target.to(device)
-            optimizer.zero_grad()
-
-            activations = model(data)
-
+        # Shuffle data
+        indices = np.random.permutation(len(train_images))
+        
+        for batch_idx in range(num_batches):
+            start_idx = batch_idx * batch_size
+            end_idx = start_idx + batch_size
+            batch_indices = indices[start_idx:end_idx]
+            
+            batch_images = train_images[batch_indices]
+            batch_labels = train_labels[batch_indices]
+            
+            # Forward pass through client model
+            with tf.GradientTape() as tape:
+                activations = model(batch_images, training=True)
+            
             # Send activations to server
             payload = {
-                "activations": activations.clone().detach(), 
-                "labels": target,
-                "step": global_step 
+                "activations": activations.numpy(),
+                "labels": batch_labels,
+                "step": epoch * num_batches + batch_idx
             }
             serialized_data = pickle.dumps(payload)
-
+            
             try:
-                response = requests.post(SERVER_URL_SPLIT, data=serialized_data)
+                response = requests.post(
+                    SERVER_URL_SPLIT,
+                    data=serialized_data,
+                    timeout=30
+                )
                 
                 if response.status_code != 200:
                     print(f"Error {response.status_code}: {response.content}")
                     continue
-
-                server_grads = pickle.loads(response.content).to(device)
-                activations.backward(server_grads)
-                optimizer.step()
                 
-                if global_step % 10 == 0:
-                     print(f"Epoch {epoch} | Step {global_step} | Updated")
+                # Receive gradients from server
+                server_grads = pickle.loads(response.content)
+                server_grads_tensor = tf.constant(server_grads, dtype=tf.float32)
                 
-                global_step += 1
-
+                # Backward pass
+                gradients = tape.gradient(activations, model.trainable_variables, output_gradients=server_grads_tensor)
+                model.optimizer.apply_gradients(zip(gradients, model.trainable_variables))
+                
+                if batch_idx % 100 == 0:
+                    print(f"Epoch {epoch} | Batch {batch_idx}/{num_batches}")
+                
             except Exception as e:
                 print(f"Communication failed: {e}")
-
-def train_federated_learning():
-    """Training loop for Federated Learning mode"""
-    model.train()
-    global_step = 0
-    
-    for epoch in range(1, 4):  # Train for 3 epochs
-        print(f"--- [FEDERATED LEARNING] Starting Epoch {epoch} ---")
-        epoch_loss = 0.0
-        num_batches = 0
-        
-        for batch_idx, (data, target) in enumerate(train_loader):
-            data, target = data.to(device), target.to(device)
-            optimizer.zero_grad()
-
-            # Complete forward and backward pass locally
-            outputs = model(data)
-            loss = criterion(outputs, target)
-            loss.backward()
-            optimizer.step()
-            
-            epoch_loss += loss.item()
-            num_batches += 1
-            
-            if global_step % 10 == 0:
-                print(f"Epoch {epoch} | Step {global_step} | Loss: {loss.item():.4f}")
-            
-            global_step += 1
-        
-        # After each epoch, send model weights to server for aggregation
-        avg_loss = epoch_loss / num_batches
-        print(f"Epoch {epoch} complete. Average Loss: {avg_loss:.4f}")
-        print(f"Sending model weights to server for aggregation...")
-        
-        try:
-            # Send model state dict to server
-            payload = {
-                "model_state": model.state_dict(),
-                "epoch": epoch,
-                "loss": avg_loss,
-                "step": global_step - 1  # Last step of the epoch
-            }
-            serialized_data = pickle.dumps(payload)
-            
-            response = requests.post(SERVER_URL_FEDERATED, data=serialized_data)
-            
-            if response.status_code != 200:
-                print(f"Error {response.status_code}: {response.content}")
                 continue
-            
-            # Receive aggregated model from server
-            aggregated_state = pickle.loads(response.content)
-            model.load_state_dict(aggregated_state)
-            print(f"Received aggregated model from server")
-            
-        except Exception as e:
-            print(f"Communication failed: {e}")
-
-def train():
-    """Main training function that selects the appropriate training loop"""
-    print(f"Starting training in {learning_mode.upper()} mode...")
+        
+        print(f"Epoch {epoch} complete")
     
-    if learning_mode == "split":
-        train_split_learning()
-    elif learning_mode == "federated":
-        train_federated_learning()
-    else:
-        raise ValueError(f"Unknown LEARNING_MODE: {learning_mode}. Use 'split' or 'federated'.")
+    print("Split learning training complete!")
 
-if __name__ == "__main__":
-    train()
+else:  # Federated Learning
+    # Federated Learning Training Loop
+    print("Training full model locally...")
+    
+    history = model.fit(
+        train_images,
+        train_labels,
+        batch_size=64,
+        epochs=3,
+        validation_split=0.1,
+        verbose=1
+    )
+    
+    print("Federated learning training complete!")
+    
+    # Optionally send weights to server for aggregation
+    try:
+        weights_dict = {f"layer_{i}": w for i, w in enumerate(model.get_weights())}
+        payload = {
+            "weights": weights_dict,
+            "step": 0
+        }
+        response = requests.post(
+            SERVER_URL_FEDERATED,
+            data=pickle.dumps(payload),
+            timeout=30
+        )
+        if response.status_code == 200:
+            print("Weights sent to server for aggregation")
+    except Exception as e:
+        print(f"Could not send weights to server: {e}")
+
+print("Training complete!")

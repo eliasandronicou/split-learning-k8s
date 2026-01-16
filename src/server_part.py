@@ -1,19 +1,38 @@
-import torch
-import torch.optim as optim
+import tensorflow as tf
+from tensorflow import keras
+from tensorflow.keras import layers
 import pickle
 import mlflow
+import mlflow.tensorflow
 import os
+import numpy as np
 from fastapi import FastAPI, Request, Response
-from model_def import get_model
 
 app = FastAPI()
 
-# Setup Device, Model, Optimizer
-device = "cpu"
+# Setup Device and Learning Mode
 learning_mode = os.getenv("LEARNING_MODE", "split").lower()
-model = get_model(role="server").to(device)
-optimizer = optim.SGD(model.parameters(), lr=0.01)
-criterion = torch.nn.CrossEntropyLoss()
+
+# Create TensorFlow/Keras model for server (Part B)
+def create_server_model():
+    """Server-side model for split learning"""
+    model = keras.Sequential([
+        layers.Input(shape=(26, 26, 32)),  # Output from client's Conv2D(32, 3) on 28x28
+        layers.Conv2D(64, 3, activation='relu'),
+        layers.MaxPooling2D(2),
+        layers.Flatten(),
+        layers.Dense(10, activation='softmax')
+    ], name='ServerModel')
+    
+    model.compile(
+        optimizer='adam',
+        loss='sparse_categorical_crossentropy',
+        metrics=['accuracy']
+    )
+    return model
+
+# Initialize model
+model = create_server_model()
 
 # MLflow Setup
 mlflow.set_tracking_uri("http://mlflow.mlflow.svc.cluster.local:5000")
@@ -35,34 +54,62 @@ async def forward_pass(request: Request):
             status_code=400
         )
     
-    body = await request.body()
-    data = pickle.loads(body)
-    
-    client_activations = data["activations"].to(device)
-    labels = data["labels"].to(device)
-    step = data["step"]
+    try:
+        body = await request.body()
+        data = pickle.loads(body)
+        
+        # Convert numpy arrays to TensorFlow tensors
+        client_activations = tf.constant(data["activations"], dtype=tf.float32)
+        labels = tf.constant(data["labels"], dtype=tf.int64)
+        step = data["step"]
+        
+        # Ensure activations are tracked for gradients
+        client_activations = tf.Variable(client_activations, trainable=True)
+        
+        # Forward pass with gradient tape
+        with tf.GradientTape(persistent=True) as tape:
+            tape.watch(client_activations)
+            outputs = model(client_activations, training=True)
+            loss = tf.keras.losses.sparse_categorical_crossentropy(labels, outputs)
+            loss = tf.reduce_mean(loss)
+        
+        # Compute gradients
+        gradients_wrt_activations = tape.gradient(loss, client_activations)
+        gradients_wrt_model = tape.gradient(loss, model.trainable_variables)
+        
+        # Apply gradients to model
+        model.optimizer.apply_gradients(zip(gradients_wrt_model, model.trainable_variables))
+        
+        # Log to MLflow
+        if step % 100 == 0:
+            mlflow.log_metric("loss", float(loss.numpy()), step=step)
+            print(f"Step {step} | Loss: {loss.numpy():.4f}")
+        
+        # Return gradients as numpy array
+        grad_numpy = gradients_wrt_activations.numpy()
+        
+        del tape  # Clean up persistent tape
+        
+        return Response(
+            content=pickle.dumps(grad_numpy),
+            media_type="application/octet-stream"
+        )
+        
+    except Exception as e:
+        print(f"Error in forward_pass: {e}")
+        import traceback
+        traceback.print_exc()
+        return Response(
+            content=f"Internal server error: {str(e)}",
+            status_code=500
+        )
 
-    client_activations.requires_grad_(True)
-
-    optimizer.zero_grad()
-    outputs = model(client_activations)
-    loss = criterion(outputs, labels)
-
-    loss.backward()
-    optimizer.step()
-
-    # Log metric to MLflow
-    mlflow.log_metric("loss", loss.item(), step=step)
-
-    cut_layer_gradient = client_activations.grad.clone().detach()
-    return Response(content=pickle.dumps(cut_layer_gradient), media_type="application/octet-stream")
 
 @app.post("/aggregate_weights")
 async def aggregate_weights(request: Request):
     """
     Endpoint for Federated Learning mode.
-    Receives model weights from client, performs aggregation (simple update for single client),
-    and returns aggregated model to client.
+    Receives model weights from clients and aggregates them.
     """
     if learning_mode != "federated":
         return Response(
@@ -70,33 +117,46 @@ async def aggregate_weights(request: Request):
             status_code=400
         )
     
-    body = await request.body()
-    data = pickle.loads(body)
-    
-    client_model_state = data["model_state"]
-    epoch = data["epoch"]
-    client_loss = data["loss"]
-    step = data["step"]
-    
-    # For single client: simply update server model with client model
-    # For multiple clients: this would aggregate multiple client models
-    model.load_state_dict(client_model_state)
-    
-    # Log metrics to MLflow
-    mlflow.log_metric("loss", client_loss, step=step)
-    mlflow.log_metric("epoch", epoch, step=step)
-    
-    print(f"Aggregated model at epoch {epoch}, step {step}, loss: {client_loss:.4f}")
-    
-    # Return the aggregated model (in this case, same as client for single client)
-    aggregated_state = model.state_dict()
-    return Response(content=pickle.dumps(aggregated_state), media_type="application/octet-stream")
+    try:
+        body = await request.body()
+        data = pickle.loads(body)
+        
+        client_weights = data["weights"]
+        step = data["step"]
+        
+        # Convert to TensorFlow format if needed
+        if isinstance(client_weights, dict):
+            # Set model weights
+            model.set_weights([np.array(w) for w in client_weights.values()])
+        
+        # Log to MLflow
+        if step % 100 == 0:
+            mlflow.log_metric("aggregation_step", step, step=step)
+            print(f"Aggregated weights at step {step}")
+        
+        return Response(
+            content=pickle.dumps({"status": "success"}),
+            media_type="application/octet-stream"
+        )
+        
+    except Exception as e:
+        print(f"Error in aggregate_weights: {e}")
+        import traceback
+        traceback.print_exc()
+        return Response(
+            content=f"Internal server error: {str(e)}",
+            status_code=500
+        )
+
 
 @app.get("/health")
 async def health():
     """Health check endpoint"""
-    return {
-        "status": "healthy",
-        "mode": learning_mode,
-        "model_type": type(model).__name__
-    }
+    return {"status": "healthy", "mode": learning_mode, "framework": "tensorflow"}
+
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Clean up MLflow run on shutdown"""
+    if active_run:
+        mlflow.end_run()

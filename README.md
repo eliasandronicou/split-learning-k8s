@@ -1,6 +1,7 @@
 # Split Learning Simulation on Kubernetes
+![Warning](https://img.shields.io/badge/TensorFlow-THIS_IS_THE_TensFlow_VERSION-red?style=for-the-badge&logo=tensorflow)
 
-This repository simulates a **Split Learning** architecture using Kubernetes (k3d). It separates a PyTorch Neural Network into two parts across different pods:
+This repository simulates a **Split Learning** architecture using Kubernetes (k3d). It separates a TensorFlow Neural Network into two parts across different pods:
 1. **Client Pod:** Holds data & bottom layers. Computes activations.
 2. **Server Pod:** Holds top layers & labels. Computes gradients and logs loss.
 
@@ -11,7 +12,7 @@ This repository simulates a **Split Learning** architecture using Kubernetes (k3
 | **Orchestrator** | Kubernetes (k3d) | Manages container lifecycle |
 | **Tracker** | MLflow v2.9.2 | Tracks loss curves and metrics |
 | **Communication** | FastAPI / HTTP | Transmits "smashed data" (tensors) |
-| **Model** | PyTorch (CPU-only) | Split CNN (MNIST) |
+| **Model** | TensorFlow (CPU-only) | Split CNN (MNIST) |
 | **Storage** | SeaweedFS (S3) | Artifact storage |
 | **Database** | PostgreSQL 13 | MLflow backend store |
 
@@ -62,7 +63,7 @@ This may take 2-3 minutes for all images to pull and pods to start.
 
 ### 3. Build & Import Application Image
 
-Build the optimized Docker image with CPU-only PyTorch:
+Build the optimized Docker image with CPU-only TensorFlow:
 
 ```bash
 cd src
@@ -256,7 +257,7 @@ kubectl apply -f k8s/mlflow-stack.yaml
 ```
 split-learning-k8s/
 ├── src/
-│   ├── Dockerfile              # Multi-stage build with CPU-only PyTorch
+│   ├── Dockerfile              # Multi-stage build with CPU-only TensorFlow
 │   ├── requirements.txt        # Python dependencies (mlflow==2.9.2)
 │   ├── .dockerignore          # Files to exclude from Docker build
 │   ├── server_part.py         # Server-side model and FastAPI endpoints

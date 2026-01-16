@@ -14,10 +14,8 @@ WORKDIR /build
 # Copy and install Python dependencies
 COPY requirements.txt .
 
-# Install PyTorch CPU-only from PyTorch index
-RUN pip install --no-cache-dir \
-    --index-url https://download.pytorch.org/whl/cpu \
-    torch==2.2.0+cpu torchvision==0.17.0+cpu
+# Install TensorFlow CPU-only (smaller image, no GPU support)
+RUN pip install --no-cache-dir tensorflow-cpu==2.15.0
 
 # Install other dependencies
 RUN pip install --no-cache-dir \
@@ -26,7 +24,6 @@ RUN pip install --no-cache-dir \
     requests==2.31.0 \
     mlflow==2.9.2 \
     boto3==1.34.0 \
-    numpy==1.26.3 \
     scikit-learn==1.4.0
 
 # ============================================
